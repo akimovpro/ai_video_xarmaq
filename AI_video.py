@@ -233,20 +233,11 @@ if __name__ == '__main__':
     threading.Thread(target=ping_loop, daemon=True).start()
 
     app = Application.builder().token(BOT_TOKEN).build()
-    
-    # (keep_alive_ping is handled by background thread)
-
     app.add_handler(CommandHandler('start', start))
     app.add_handler(CommandHandler('language', language_cmd))
     app.add_handler(CommandHandler('help', help_cmd))
     app.add_handler(CallbackQueryHandler(language_button, pattern='^lang_'))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    # Use webhook instead of polling to avoid conflicts
-    port = int(os.environ.get('PORT', 8080))
-    webhook_url = f"{APP_URL}/bot{BOT_TOKEN}"
-    app.run_webhook(
-        listen="0.0.0.0",
-        port=port,
-        webhook_url=webhook_url
-    )
+    # Run polling (ensure only one instance)
+    app.run_polling()
