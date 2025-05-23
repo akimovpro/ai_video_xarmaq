@@ -1,6 +1,7 @@
 import os
 import logging
 import re
+import httpx
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
 from telegram.ext import (
     Application,
@@ -11,15 +12,19 @@ from telegram.ext import (
     ContextTypes,
 )
 from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound
-from openai import OpenAI
+import openai
 
 # Load secrets from environment variables
 BOT_TOKEN = os.getenv('BOT_TOKEN')
 OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
+APP_URL = os.getenv('APP_URL')  # For keep-alive ping
 
 # Validate environment variables
 if not BOT_TOKEN or not OPENAI_API_KEY:
     raise RuntimeError('Environment variables BOT_TOKEN and OPENAI_API_KEY must be set')
+
+# Initialize OpenAI client
+openai.api_key = OPENAI_API_KEY
 
 # Enable logging
 logging.basicConfig(
@@ -27,9 +32,6 @@ logging.basicConfig(
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
-
-# Initialize OpenAI client
-openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
 # In-memory user language prefs
 euser_languages = {}
@@ -125,10 +127,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         prompt = 'Send YouTube link:' if lang=='en' else 'Отправьте ссылку на YouTube:'
         await update.message.reply_text(prompt, reply_markup=menu)
         return
-    if text in ['🌐 Change Language', '🌐 Сменить язык']:
+    if text in ['�🌐 Change Language', '🌐 Сменить язык']:
         await language_cmd(update, context)
         return
-    if text in ['❓ Help', '❓ Помощь']:
+    if text in ['�❓ Help', '❓ Помощь']:
         await help_cmd(update, context)
         return
 
@@ -175,7 +177,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Call OpenAI
     try:
-        resp = openai_client.chat.completions.create(
+        resp = openai.ChatCompletion.create(
             model='gpt-3.5-turbo',
             messages=[
                 {'role':'system','content':'You summarize YouTube transcripts.'},
@@ -191,12 +193,25 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(output, parse_mode='Markdown', reply_markup=menu)
 
+# Keep-alive ping to prevent sleeping
+async def keep_alive_ping(context: ContextTypes.DEFAULT_TYPE):
+    if not APP_URL:
+        return
+    try:
+        async with httpx.AsyncClient() as client:
+            await client.get(APP_URL)
+    except Exception as e:
+        logger.warning(f"Keep-alive ping failed: {e}")
+
 # Entry point
 if __name__ == '__main__':
     app = Application.builder().token(BOT_TOKEN).build()
+    app.job_queue.run_repeating(keep_alive_ping, interval=30, first=10)
+
     app.add_handler(CommandHandler('start', start))
     app.add_handler(CommandHandler('language', language_cmd))
     app.add_handler(CommandHandler('help', help_cmd))
     app.add_handler(CallbackQueryHandler(language_button, pattern='^lang_'))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
     app.run_polling()
