@@ -102,11 +102,26 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     await update.message.reply_text(text, parse_mode='Markdown', reply_markup=menu)
 
-# Fetch transcript
+# Fetch transcript with fallback to manual or auto-generated
 def fetch_transcript(video_id: str):
+    from youtube_transcript_api import YouTubeTranscriptApi
     try:
-        return YouTubeTranscriptApi.get_transcript(video_id, languages=['en','ru'])
-    except (TranscriptsDisabled, NoTranscriptFound):
+        # Try manual or generated via list_transcripts
+        transcripts = YouTubeTranscriptApi.list_transcripts(video_id)
+        try:
+            transcript = transcripts.find_manually_created_transcript(['en', 'ru'])
+        except Exception:
+            transcript = transcripts.find_generated_transcript(['en', 'ru'])
+        return transcript.fetch()
+    except Exception:
+        # Fallback to simple get_transcript which may fetch auto-generated too
+        try:
+            return YouTubeTranscriptApi.get_transcript(video_id, languages=['en','ru'])
+        except Exception as e:
+            logger.error(f"Transcript fetch fallback error: {e}")
+            return None
+    except Exception as e:
+        logger.error(f"Transcript fetch error: {e}")
         return None
     except Exception as e:
         logger.error(f"Transcript fetch error: {e}")
@@ -227,4 +242,11 @@ if __name__ == '__main__':
     app.add_handler(CallbackQueryHandler(language_button, pattern='^lang_'))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    app.run_polling()
+    # Use webhook instead of polling to avoid conflicts
+    port = int(os.environ.get('PORT', 8080))
+    webhook_url = f"{APP_URL}/bot{BOT_TOKEN}"
+    app.run_webhook(
+        listen="0.0.0.0",
+        port=port,
+        webhook_url=webhook_url
+    )
