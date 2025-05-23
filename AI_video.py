@@ -159,7 +159,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         content = seg.get('text', '') if isinstance(seg, dict) else getattr(seg, 'text', '')
         mns, secs = divmod(int(start), 60)
         segments.append(f"[{mns:02d}:{secs:02d}] {content}")
-    # Correctly join segments with newline
+        # Correctly join segments with newline
     full_text = "
 ".join(segments)
 
