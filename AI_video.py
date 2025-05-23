@@ -217,7 +217,9 @@ if __name__ == '__main__':
             time.sleep(30)
     threading.Thread(target=ping_loop, daemon=True).start()
 
-    app = Application.builder().token(BOT_TOKEN).build()(keep_alive_ping, interval=30, first=10)
+    app = Application.builder().token(BOT_TOKEN).build()
+    
+    # (keep_alive_ping is handled by background thread)
 
     app.add_handler(CommandHandler('start', start))
     app.add_handler(CommandHandler('language', language_cmd))
