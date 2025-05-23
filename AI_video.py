@@ -152,13 +152,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(msg, reply_markup=menu)
         return
 
-    # Build timecoded text
+        # Build timecoded text
     segments = []
     for seg in transcript:
         start = seg.get('start', 0) if isinstance(seg, dict) else getattr(seg, 'start', 0)
         content = seg.get('text', '') if isinstance(seg, dict) else getattr(seg, 'text', '')
         mns, secs = divmod(int(start), 60)
         segments.append(f"[{mns:02d}:{secs:02d}] {content}")
+    # Correctly join segments with newline
     full_text = "
 ".join(segments)
 
@@ -173,6 +174,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             'Сначала список ключевых пунктов с таймкодами. '
             'Затем 2-3 абзаца связного пересказа, каждый абзац с таймкодом.'
         )
+    # Combine instruction and transcript
     ai_prompt = instr + "
 
 " + full_text
