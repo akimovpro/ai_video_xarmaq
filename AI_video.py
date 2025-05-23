@@ -205,8 +205,19 @@ async def keep_alive_ping(context: ContextTypes.DEFAULT_TYPE):
 
 # Entry point
 if __name__ == '__main__':
-    app = Application.builder().token(BOT_TOKEN).build()
-    app.job_queue.run_repeating(keep_alive_ping, interval=30, first=10)
+    # Start keep-alive thread to prevent sleeping
+    import threading, time
+    def ping_loop():
+        while True:
+            if APP_URL:
+                try:
+                    httpx.get(APP_URL)
+                except Exception:
+                    pass
+            time.sleep(30)
+    threading.Thread(target=ping_loop, daemon=True).start()
+
+    app = Application.builder().token(BOT_TOKEN).build()(keep_alive_ping, interval=30, first=10)
 
     app.add_handler(CommandHandler('start', start))
     app.add_handler(CommandHandler('language', language_cmd))
