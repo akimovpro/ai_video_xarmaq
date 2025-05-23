@@ -102,123 +102,17 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     await update.message.reply_text(text, parse_mode='Markdown', reply_markup=menu)
 
-# Fetch transcript with fallback to manual or auto-generated
+# Fetch transcript by letting library auto-select sources
 def fetch_transcript(video_id: str):
-    from youtube_transcript_api import YouTubeTranscriptApi
+    """Fetch transcript, auto-generated if no manual captions."""
     try:
-        # Try manual or generated via list_transcripts
-        transcripts = YouTubeTranscriptApi.list_transcripts(video_id)
-        try:
-            transcript = transcripts.find_manually_created_transcript(['en', 'ru'])
-        except Exception:
-            transcript = transcripts.find_generated_transcript(['en', 'ru'])
-        return transcript.fetch()
-    except Exception:
-        # Fallback to simple get_transcript which may fetch auto-generated too
-        try:
-            return YouTubeTranscriptApi.get_transcript(video_id, languages=['en','ru'])
-        except Exception as e:
-            logger.error(f"Transcript fetch fallback error: {e}")
-            return None
-    except Exception as e:
-        logger.error(f"Transcript fetch error: {e}")
-        return None
+        # get_transcript will return manual or auto-generated captions
+        return YouTubeTranscriptApi.get_transcript(video_id)
     except Exception as e:
         logger.error(f"Transcript fetch error: {e}")
         return None
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    text = update.message.text.strip()
-    lang = user_languages.get(user_id)
-    menu = get_main_menu(lang) if lang else None
-
-    if not lang:
-        await update.message.reply_text('Please /start and select language first.')
-        return
-
-    # Main menu buttons
-    if text in ['📺 Summarize Video', '📺 Аннотировать видео']:
-        prompt = 'Send YouTube link:' if lang=='en' else 'Отправьте ссылку на YouTube:'
-        await update.message.reply_text(prompt, reply_markup=menu)
-        return
-    if text in ['�🌐 Change Language', '🌐 Сменить язык']:
-        await language_cmd(update, context)
-        return
-    if text in ['�❓ Help', '❓ Помощь']:
-        await help_cmd(update, context)
-        return
-
-    # Extract video ID
-    match = re.search(YOUTUBE_REGEX, text)
-    if not match:
-        err_msg = 'Invalid YouTube URL.' if lang=='en' else 'Недействительная ссылка YouTube.'
-        await update.message.reply_text(err_msg, reply_markup=menu)
-        return
-
-    video_id = match.group(1)
-    await update.message.reply_text(
-        'Processing...⏳' if lang=='en' else 'Обработка...⏳',
-        reply_markup=menu
-    )
-
-    transcript = fetch_transcript(video_id)
-    if not transcript:
-        msg = 'Transcript not available.' if lang=='en' else 'Субтитры недоступны.'
-        await update.message.reply_text(msg, reply_markup=menu)
-        return
-
-    # Build timecoded transcript text
-    segments = []
-    for seg in transcript:
-        start = seg.get('start', 0) if isinstance(seg, dict) else getattr(seg, 'start', 0)
-        content = seg.get('text', '') if isinstance(seg, dict) else getattr(seg, 'text', '')
-        mns, secs = divmod(int(start), 60)
-        segments.append(f"[{mns:02d}:{secs:02d}] {content}")
-    full_text = '\n'.join(segments)
-
-    # Prepare AI instruction
-    if lang == 'en':
-        instr = (
-            'First, list key bullet points with timestamps. '
-            'Then provide a concise 2-3 paragraph narrative summary starting each paragraph with its timestamp.'
-        )
-    else:
-        instr = (
-            'Сначала список ключевых пунктов с таймкодами. '
-            'Затем 2-3 абзаца связного пересказа, каждый абзац с таймкодом.'
-        )
-    ai_prompt = instr + '\n\n' + full_text
-
-    # Call OpenAI
-    try:
-        resp = openai.ChatCompletion.create(
-            model='gpt-3.5-turbo',
-            messages=[
-                {'role':'system','content':'You summarize YouTube transcripts.'},
-                {'role':'user','content':ai_prompt}
-            ],
-            max_tokens=800
-        )
-        output = resp.choices[0].message.content.strip()
-    except Exception as e:
-        logger.error(f"OpenAI error: {e}")
-        await update.message.reply_text('Error generating summary.', reply_markup=menu)
-        return
-
-    await update.message.reply_text(output, parse_mode='Markdown', reply_markup=menu)
-
-# Keep-alive ping to prevent sleeping
-async def keep_alive_ping(context: ContextTypes.DEFAULT_TYPE):
-    if not APP_URL:
-        return
-    try:
-        async with httpx.AsyncClient() as client:
-            await client.get(APP_URL)
-    except Exception as e:
-        logger.warning(f"Keep-alive ping failed: {e}")
-
-# Entry point
+# Handle incoming messages...
 if __name__ == '__main__':
     # Start keep-alive thread to prevent sleeping
     import threading, time
