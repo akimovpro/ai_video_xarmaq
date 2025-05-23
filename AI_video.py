@@ -145,14 +145,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Inform processing
     await update.message.reply_text('Processing...⏳' if lang=='en' else 'Обработка...⏳', reply_markup=menu)
 
-    # Get transcript
+        # Get transcript
     transcript = fetch_transcript(video_id)
     if not transcript:
         msg = 'Transcript not available.' if lang=='en' else 'Субтитры недоступны.'
         await update.message.reply_text(msg, reply_markup=menu)
         return
 
-        # Build timecoded text
+    # Build timecoded text
     segments = []
     for seg in transcript:
         start = seg.get('start', 0) if isinstance(seg, dict) else getattr(seg, 'start', 0)
@@ -176,15 +176,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ai_prompt = instr + "
 
 " + full_text
-    if lang == 'en':
-        instr = ('First, list key bullet points with timestamps. '
-                 'Then provide a concise 2-3 paragraph narrative summary starting each paragraph with its timestamp.')
-    else:
-        instr = ('Сначала список ключевых пунктов с таймкодами. '
-                 'Затем 2-3 абзаца связного пересказа, каждый абзац с таймкодом.')
-    ai_prompt = instr + '
-
-' + full_text
 
     # Call OpenAI
     try:
