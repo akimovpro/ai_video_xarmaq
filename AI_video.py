@@ -16,25 +16,20 @@ from telegram.ext import (
 )
 from youtube_transcript_api import YouTubeTranscriptApi
 
-# Load secrets from environment variables
+# Load secrets
 BOT_TOKEN = os.getenv('BOT_TOKEN')
 OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
-APP_URL = os.getenv('APP_URL')  # For keep-alive ping
-
+APP_URL = os.getenv('APP_URL')
 if not BOT_TOKEN or not OPENAI_API_KEY:
-    raise RuntimeError('BOT_TOKEN and OPENAI_API_KEY must be set')
-
-# Initialize OpenAI
+    raise RuntimeError('Environment variables BOT_TOKEN and OPENAI_API_KEY must be set')
 openai.api_key = OPENAI_API_KEY
 
 # Logging
 logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# User language preference
+# User settings
 user_languages = {}
-
-# YouTube ID regex
 YOUTUBE_REGEX = r'(?:https?://)?(?:www\.)?(?:youtube\.com/(?:watch\?v=|shorts/)|youtu\.be/)([A-Za-z0-9_-]{11})'
 
 # Keyboards
@@ -44,162 +39,132 @@ def get_main_menu(lang: str) -> ReplyKeyboardMarkup:
         'en': ['📺 Summarize Video', '🌐 Change Language', '❓ Help'],
         'ru': ['📺 Аннотировать видео', '🌐 Сменить язык', '❓ Помощь'],
     }
-    buttons = [[lbl] for lbl in labels.get(lang, labels['en'])]
+    buttons = [[text] for text in labels.get(lang, labels['en'])]
     return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
 
-
 def get_lang_keyboard() -> InlineKeyboardMarkup:
-    kb = [[InlineKeyboardButton('🇬🇧 English', callback_data='lang_en'),
-           InlineKeyboardButton('🇷🇺 Русский', callback_data='lang_ru')]]
-    return InlineKeyboardMarkup(kb)
+    keys = [InlineKeyboardButton('🇬🇧 English', callback_data='lang_en'),
+            InlineKeyboardButton('🇷🇺 Русский', callback_data='lang_ru')]
+    return InlineKeyboardMarkup([keys])
 
 # Handlers
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         '🎉 *Welcome to YouTube Summarizer!* 🎉\nSelect language / Выберите язык:',
-        parse_mode='Markdown', reply_markup=get_lang_keyboard()
+        parse_mode='Markdown',
+        reply_markup=get_lang_keyboard()
     )
 
 async def language_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    uid = q.from_user.id
-    lang = q.data.split('_')[1]
+    query = update.callback_query
+    await query.answer()
+    uid = query.from_user.id
+    lang = query.data.split('_')[1]
     user_languages[uid] = lang
-    msg = '🌟 Language set to English!' if lang=='en' else '🌟 Язык установлен: Русский!'
-    await q.message.reply_text(msg, parse_mode='Markdown', reply_markup=get_main_menu(lang))
-    await q.message.delete()
+    msg = '🌟 Language set to English!' if lang == 'en' else '🌟 Язык установлен: Русский!'
+    await query.message.reply_text(msg, parse_mode='Markdown', reply_markup=get_main_menu(lang))
+    await query.message.delete()
 
 async def language_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text('🌐 *Select language / Выберите язык:*',
-                                    parse_mode='Markdown', reply_markup=get_lang_keyboard())
+    await update.message.reply_text(
+        '🌐 *Select language / Выберите язык:*',
+        parse_mode='Markdown',
+        reply_markup=get_lang_keyboard()
+    )
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     lang = user_languages.get(uid, 'en')
     menu = get_main_menu(lang)
-    if lang=='en':
-        text = ('1. Send a YouTube link\n'
-                '2. Get timecoded bullet points + narrative summary\n'
-                '3. /language to switch')
+    if lang == 'en':
+        text = '1️⃣ Send a YouTube link to summarize.\n2️⃣ Get timecoded bullet points and a narrative summary.\n3️⃣ Use /language to switch.'
     else:
-        text = ('1. Отправьте ссылку на YouTube\n'
-                '2. Получите таймкоды + связный пересказ\n'
-                '3. /language для смены')
+        text = '1️⃣ Отправьте ссылку на YouTube.\n2️⃣ Получите таймкоды и связный пересказ.\n3️⃣ Используйте /language.'
     await update.message.reply_text(text, parse_mode='Markdown', reply_markup=menu)
 
-# Transcript fetch
-def fetch_transcript(vid: str):
+# Transcript
+
+def fetch_transcript(video_id: str):
     try:
-        return YouTubeTranscriptApi.get_transcript(vid)
+        return YouTubeTranscriptApi.get_transcript(video_id)
     except Exception as e:
-        logger.warning(f'Transcript error: {e}')
+        logger.warning(f'Transcript fetch error: {e}')
         return None
 
-# Main message handler
+# Main handler
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    logger.info(f"handle_message invoked for user {uid}")
     lang = user_languages.get(uid)
-    logger.info(f"User language: {lang}")
     text = update.message.text.strip()
-    logger.info(f"Received text: {text}")
     menu = get_main_menu(lang) if lang else None
 
     if not lang:
-        logger.info("No language set, prompting start")
         return await update.message.reply_text('Please /start and select language first.')
-    if text in ['📺 Summarize Video','📺 Аннотировать видео']:
-        logger.info("User requested summary prompt")
-        prompt = 'Send YouTube link:' if lang=='en' else 'Отправьте ссылку:'
+    if text in ['📺 Summarize Video', '📺 Аннотировать видео']:
+        prompt = 'Send YouTube link:' if lang == 'en' else 'Отправьте ссылку на YouTube:'
         return await update.message.reply_text(prompt, reply_markup=menu)
-    if text in ['🌐 Change Language','🌐 Сменить язык']:
-        logger.info("User requested language change")
+    if text in ['🌐 Change Language', '🌐 Сменить язык']:
         return await language_cmd(update, context)
-    if text in ['❓ Help','❓ Помощь']:
-        logger.info("User requested help")
+    if text in ['❓ Help', '❓ Помощь']:
         return await help_cmd(update, context)
 
     m = re.search(YOUTUBE_REGEX, text)
-    logger.info(f"Regex match: {m}")
     if not m:
-        err = 'Invalid URL.' if lang=='en' else 'Недействительная ссылка.'
-        logger.info("Invalid URL provided")
+        err = 'Invalid YouTube URL.' if lang == 'en' else 'Недействительная ссылка.'
         return await update.message.reply_text(err, reply_markup=menu)
     vid = m.group(1)
-    logger.info(f"Extracted video ID: {vid}")
 
-    msg = 'Processing...⏳' if lang=='en' else 'Обработка...⏳'
-    await update.message.reply_text(msg, reply_markup=menu)
-    logger.info("Sent processing message")
+    await update.message.reply_text('Processing...⏳' if lang == 'en' else 'Обработка...⏳', reply_markup=menu)
+    transcript = fetch_transcript(vid)
+    if not transcript:
+        msg = 'Transcript not available.' if lang == 'en' else 'Субтитры недоступны.'
+        return await update.message.reply_text(msg, reply_markup=menu)
 
-    trans = fetch_transcript(vid)
-    logger.info(f"Fetched transcript: {'found' if trans else 'none'}")
-    if not trans:
-        msg2 = 'No transcript.' if lang=='en' else 'Субтитры недоступны.'
-        logger.info("Transcript unavailable, notifying user")
-        return await update.message.reply_text(msg2, reply_markup=menu)
-
-        # Build transcript text
-    segs = []
-    for e in trans:
-        s = int(e['start']); t = e['text']
-        mns, secs = divmod(s, 60)
-        segs.append(f"[{mns:02d}:{secs:02d}] {t}")
-    full = "\n".join(segs)
-    logger.info(f"Built full transcript text, length {len(full)}")
+    # Build timecoded text
+    parts = []
+    for seg in transcript:
+        start = seg['start']
+        text_seg = seg['text']
+        mns, secs = divmod(int(start), 60)
+        parts.append(f"[{mns:02d}:{secs:02d}] {text_seg}")
+    full_text = "\n".join(parts)
 
     # AI prompt
-    if lang=='en':
-        instr = ('List key bullet points with timestamps. '
-                 'Then 2-3 paragraph summary starting each with timestamp.')
+    if lang == 'en':
+        instruction = ('List key bullet points with timestamps. '
+                       'Then provide a concise 2-3 paragraph narrative summary starting each with the associated timestamp.')
     else:
-        instr = ('Сначала пункты с таймкодами. '
-                 'Затем 2-3 абзаца пересказа с таймкодами.')
-    prompt = instr + "\n\n" + full
-    logger.info(f"Constructed AI prompt, length {len(prompt)}")
+        instruction = ('Сначала пункты с таймкодами. '
+                       'Затем 2-3 абзаца связного пересказа, каждый абзац с таймкодом.')
+    ai_prompt = instruction + "\n\n" + full_text
 
     try:
-        res = openai.ChatCompletion.create(
+        response = openai.ChatCompletion.create(
             model='gpt-3.5-turbo',
-            messages=[{'role':'user','content':prompt}], max_tokens=600
+            messages=[{'role': 'system', 'content': 'You summarize YouTube video transcripts.'},
+                      {'role': 'user', 'content': ai_prompt}],
+            max_tokens=700,
         )
-        out = res.choices[0].message.content
-        logger.info("Received AI response")
+        result = response.choices[0].message.content.strip()
     except Exception as e:
-        logger.error(f'AI error: {e}')
-        return await update.message.reply_text('Error.', reply_markup=menu)
+        logger.error(f'OpenAI error: {e}')
+        return await update.message.reply_text('Error generating summary.', reply_markup=menu)
 
-    await update.message.reply_text(out, parse_mode='Markdown', reply_markup=menu)
-    logger.info("Sent final summary to user")
+    await update.message.reply_text(result, parse_mode='Markdown', reply_markup=menu)
 
 # Keep-alive ping
+
 def ping():
     while True:
         if APP_URL:
-            try: httpx.get(APP_URL)
-            except: pass
+            try:
+                httpx.get(APP_URL)
+            except:
+                pass
         time.sleep(30)
 
-# Run bot
-if __name__=='__main__':
-    threading.Thread(target=ping, daemon=True).start()
-    app = Application.builder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler('start', start))
-    app.add_handler(CommandHandler('language', language_cmd))
-    app.add_handler(CommandHandler('help', help_cmd))
-    app.add_handler(CallbackQueryHandler(language_button, pattern='^lang_'))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    app.run_polling()
-def ping():
-    while True:
-        if APP_URL:
-            try: httpx.get(APP_URL)
-            except: pass
-        time.sleep(30)
-
-# Run bot
-if __name__=='__main__':
+# Run
+if __name__ == '__main__':
     threading.Thread(target=ping, daemon=True).start()
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler('start', start))
