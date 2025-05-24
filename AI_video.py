@@ -2,6 +2,8 @@ import os
 import logging
 import re
 import httpx
+import threading
+import time
 import openai
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
 from telegram.ext import (
@@ -13,12 +15,13 @@ from telegram.ext import (
     ContextTypes,
 )
 from youtube_transcript_api import YouTubeTranscriptApi
+from pytube import YouTube
 
 # Load environment variables
 BOT_TOKEN = os.getenv('BOT_TOKEN')
 OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
 APP_URL = os.getenv('APP_URL')      # e.g. https://your-app.onrender.com
-PORT = int(os.getenv('PORT', 443))
+PORT = int(os.getenv('PORT', '443'))
 
 if not BOT_TOKEN or not OPENAI_API_KEY or not APP_URL:
     raise RuntimeError('BOT_TOKEN, OPENAI_API_KEY, and APP_URL must be set')
@@ -77,17 +80,40 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lang = user_languages.get(uid, 'en')
     menu = get_main_menu(lang)
     if lang=='en':
-        text = '1️⃣ Send YouTube link\n2️⃣ Get summary\n3️⃣ /language'
+        text = '1️⃣ Send YouTube link\n2️⃣ Receive bullet points + narrative summary\n3️⃣ /language'
     else:
-        text = '1️⃣ Отправьте ссылку\n2️⃣ Получите пересказ\n3️⃣ /language'
+        text = '1️⃣ Отправьте ссылку\n2️⃣ Получите пункты + пересказ\n3️⃣ /language'
     await update.message.reply_text(text, parse_mode='Markdown', reply_markup=menu)
 
-# Fetch transcript
-def fetch_transcript(vid: str):
+# Fetch transcript with pytube fallback
+def fetch_transcript(video_id: str):
+    # Try youtube_transcript_api first
     try:
-        return YouTubeTranscriptApi.get_transcript(vid)
+        return YouTubeTranscriptApi.get_transcript(video_id)
+    except Exception:
+        pass
+    # Fallback to pytube captions
+    try:
+        url = f'https://www.youtube.com/watch?v={video_id}'
+        yt = YouTube(url)
+        # prefer manual then auto
+        cap = yt.captions.get_by_language_code('en') or yt.captions.get_by_language_code('ru')
+        if not cap:
+            cap = yt.captions.get_by_language_code('a.en') or yt.captions.get_by_language_code('a.ru')
+        if not cap:
+            return None
+        srt = cap.generate_srt_captions()
+        entries = []
+        import re as _re
+        pattern = _re.compile(r"(\d+)\n(\d{2}):(\d{2}):(\d{2}),(\d{3}) --> .*?\n(.*?)(?=(?:\n\n|$))", _re.S)
+        for m in pattern.finditer(srt):
+            h, mn, s = int(m.group(2)), int(m.group(3)), int(m.group(4))
+            start = h*3600 + mn*60 + s
+            text = m.group(6).replace('\n', ' ')
+            entries.append({'start': start, 'text': text})
+        return entries
     except Exception as e:
-        logger.warning(f'Transcript error: {e}')
+        logger.warning(f'Pytube fallback error: {e}')
         return None
 
 # Main message handler
@@ -112,22 +138,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await update.message.reply_text(
             'Invalid URL.' if lang=='en' else 'Недействительная ссылка.', reply_markup=menu)
     vid = m.group(1)
-
     await update.message.reply_text('Processing...' if lang=='en' else 'Обработка...', reply_markup=menu)
     trans = fetch_transcript(vid)
     if not trans:
         return await update.message.reply_text(
             'No transcript.' if lang=='en' else 'Субтитры недоступны.', reply_markup=menu)
 
-    parts = [f"[{int(e['start'])//60:02d}:{int(e['start'])%60:02d}] {e['text']}" for e in trans]
+    parts = [f"[{e['start']//60:02d}:{e['start']%60:02d}] {e['text']}" for e in trans]
     full = "\n".join(parts)
     instr = (
         'List key bullet points with timestamps, then a concise 2-3 paragraph summary starting each with timestamp.'
-        if lang=='en'
-        else 'Сначала пункты с таймкодами, затем 2-3 абзаца пересказа с таймкодами.'
+        if lang=='en' else
+        'Сначала пункты с таймкодами, затем 2-3 абзаца пересказа с таймкодами.'
     )
     prompt = instr + "\n\n" + full
-
     resp = openai.ChatCompletion.create(
         model='gpt-3.5-turbo',
         messages=[{'role':'system','content':'You summarize transcripts.'}, {'role':'user','content':prompt}],
@@ -135,40 +159,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await update.message.reply_text(resp.choices[0].message.content, parse_mode='Markdown', reply_markup=menu)
 
-# Entry via webhook
-def main():
-    # Build application
+# Webhook entry
+if __name__=='__main__':
     app = Application.builder().token(BOT_TOKEN).build()
-    # Handlers
     app.add_handler(CommandHandler('start', start))
     app.add_handler(CommandHandler('language', language_cmd))
     app.add_handler(CommandHandler('help', help_cmd))
     app.add_handler(CallbackQueryHandler(language_button, pattern='^lang_'))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-
-        # Webhook setup
-    port = int(os.getenv('PORT'))
     webhook_path = f"/bot{BOT_TOKEN}"
     webhook_url = f"{APP_URL}{webhook_path}"
-
-    # Start webhook listener with built-in webhook registration
-    logger.info(f"Starting webhook listener on port {port}, path {webhook_path}, URL {webhook_url}")
+    logger.info(f"Starting webhook at {webhook_url}")
     app.run_webhook(
         listen='0.0.0.0',
-        port=port,
+        port=PORT,
         url_path=webhook_path,
         webhook_url=webhook_url,
-        drop_pending_updates=True,
+        drop_pending_updates=True
     )
-
-if __name__=='__main__':
-    main()
-    logger.info(f"Starting webhook listener on port {port}, path {webhook_path}")
-    app.run_webhook(
-        listen='0.0.0.0',
-        port=port,
-        url_path=webhook_path
-    )
-
-if __name__=='__main__':
-    main()
