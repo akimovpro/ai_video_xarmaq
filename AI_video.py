@@ -96,11 +96,6 @@ T = {
     },
     "summarizing": {"en": "📝 Summarizing…", "ru": "📝 Составляем аннотацию…"},
     "openai_error": {"en": "⚠️ OpenAI error:", "ru": "⚠️ Ошибка OpenAI:"},
-    # Дополнительные строки для чанкинга (если будете использовать в будущем)
-    "summarizing_long_video": {"en": "📝 Summarizing long video, this may take a while...", "ru": "📝 Аннотируем длинное видео, это может занять некоторое время..."},
-    "summarizing_chunk": {"en": "📝 Summarizing part", "ru": "📝 Аннотируем часть"},
-    "creating_final_summary": {"en": "📝 Creating final summary...", "ru": "📝 Создаем итоговую аннотацию..."},
-    "error_summarizing_chunk": {"en": "Error summarizing part", "ru": "Ошибка при аннотации части"},
 }
 
 MENU_ITEMS = {
@@ -112,6 +107,7 @@ MENU_ITEMS = {
 
 def tr(key: str, lang: str) -> str:
     """Translate helper with graceful fallback to English."""
+
     return T.get(key, {}).get(lang) or T.get(key, {}).get("en") or key
 
 
@@ -149,8 +145,8 @@ def _ts2sec(h: int, m: int, s: int) -> int:
 def parse_srt(text: str) -> list:
     entries = []
     for m in SRT_PATTERN.finditer(text):
-        start_ts_str = m.group(1).split(",")[0]
-        h, mi, s = map(int, start_ts_str.split(":"))
+        start = m.group(1).split(",")[0]
+        h, mi, s = map(int, start.split(":"))
         body = " ".join(line.strip() for line in m.group(2).splitlines() if line.strip())
         if body:
             entries.append({"start": _ts2sec(h, mi, s), "text": body})
@@ -163,8 +159,8 @@ def parse_vtt(text: str) -> list:
     i = 0
     while i < len(lines):
         if "-->" in lines[i]:
-            ts_str = lines[i].split("-->")[0].strip()
-            m = VTT_TS_RE.search(ts_str)
+            ts = lines[i].split("-->")[0].strip()
+            m = VTT_TS_RE.search(ts)
             i += 1
             body_lines = []
             while i < len(lines) and lines[i].strip():
@@ -185,7 +181,17 @@ def parse_captions(text: str, ext: str) -> list | None:
 # FETCH CAPTIONS WITH MINIMUM TRAFFIC
 # -----------------------------------------------------------------------------
 async def fetch_transcript(video_id_or_url: str, langs: list[str] | None = None) -> list | None:
+    """Return list of dicts with keys start (int seconds) and text (str).
+
+    Strategy:
+    1. Try *youtube-transcript-api* — only a small JSON response (a few KB).
+    2. If that fails (disabled/no subtitles), fall back to *yt-dlp* with
+       aggressive traffic‑saving options (extract_flat, no playlist, no DASH).
+    """
+
     langs = langs or ["ru", "en"]
+
+    # Normalise to bare video_id for the lightweight API
     video_id_match = YOUTUBE_STD_REGEX.search(video_id_or_url)
     video_id = video_id_match.group(1) if video_id_match else video_id_or_url
 
@@ -195,13 +201,14 @@ async def fetch_transcript(video_id_or_url: str, langs: list[str] | None = None)
             None, lambda: YouTubeTranscriptApi.get_transcript(video_id, languages=langs)
         )
         return [
-            {"start": int(float(it["start"])), "text": it["text"]} # Сохраняем исходный текст с \n
+            {"start": int(float(it["start"])), "text": it["text"].replace("\n", " ")}
             for it in transcript_data
             if it.get("text")
         ]
     except (TranscriptsDisabled, NoTranscriptFound, Exception) as e:  # noqa: BLE001
         logger.info("Transcript API failed (%s), falling back to yt_dlp", e)
 
+    # Heavier fallback but still optimised
     ydl_opts = {
         "writesubtitles": True,
         "writeautomaticsub": True,
@@ -211,16 +218,18 @@ async def fetch_transcript(video_id_or_url: str, langs: list[str] | None = None)
         "quiet": True,
         "proxy": YTDLP_PROXY_URL,
         "logger": logger,
-        "extract_flat": "in_playlist",
+        # minimise extra requests / formats parsing
+        "extract_flat": "in_playlist",  # do not fetch stream info
         "cachedir": False,
         "nocheckcertificate": True,
+        # avoid downloading DASH manifests (~several hundred KB)
         "extractor_args": {"youtube": {"skip": ["dash"]}},
     }
 
     def _pick(pool):
-        for lang_code in langs:
+        for lang in langs:
             for ext in ("srt", "vtt"):
-                for it in pool.get(lang_code, []):
+                for it in pool.get(lang, []):
                     if it.get("ext") == ext and it.get("url"):
                         return it["url"], ext
         return None, None
@@ -229,30 +238,9 @@ async def fetch_transcript(video_id_or_url: str, langs: list[str] | None = None)
         info = await loop.run_in_executor(None, lambda: ydl.extract_info(video_id_or_url, download=False))
     if not info:
         return None
-    
-    subtitles_info = info.get("subtitles", {})
-    auto_captions_info = info.get("automatic_captions", {})
-
-    # Объединяем словари субтитров, чтобы поиск был по всем доступным
-    # (на случай если yt-dlp вернул их в разных структурах для разных языков)
-    # Приоритет ручным субтитрам, если язык совпадает
-    merged_subs = {}
-    for lang_code in langs:
-        if lang_code in subtitles_info:
-             merged_subs.setdefault(lang_code, []).extend(subtitles_info[lang_code])
-        if lang_code in auto_captions_info:
-             merged_subs.setdefault(lang_code, []).extend(auto_captions_info[lang_code])
-    
-    # Если для предпочтительных языков ничего нет, смотрим все что есть
-    if not any(lang_code in merged_subs for lang_code in langs):
-        for lang_code in subtitles_info: # все доступные ручные
-            merged_subs.setdefault(lang_code, []).extend(subtitles_info[lang_code])
-        for lang_code in auto_captions_info: # все доступные автоматические
-             merged_subs.setdefault(lang_code, []).extend(auto_captions_info[lang_code])
-
-
-    url, ext = _pick(merged_subs) # Используем _pick на объединенном словаре
-    
+    url, ext = _pick(info.get("subtitles", {}))
+    if not url:
+        url, ext = _pick(info.get("automatic_captions", {}))
     if not url:
         return None
 
@@ -268,11 +256,14 @@ async def fetch_transcript(video_id_or_url: str, langs: list[str] | None = None)
 async def robust_edit(msg: Message | None, text: str, ctx, upd, kb, md: str | None = None):
     if msg:
         try:
-            return await msg.edit_text(text, reply_markup=kb, parse_mode=md)
+            await msg.edit_text(text, reply_markup=kb, parse_mode=md)
+            return msg
         except TelegramBadRequest:
-            pass  # Если не удалось отредактировать, отправим новое сообщение
+            pass
     return await ctx.bot.send_message(upd.effective_chat.id, text, reply_markup=kb, parse_mode=md)
 
+
+# UI keyboards
 
 def main_menu(lang):
     return ReplyKeyboardMarkup(
@@ -295,23 +286,13 @@ def lang_kb():
         ]
     )
 
-# Новая вспомогательная функция для форматирования времени
-def format_timestamp_hms(seconds: int) -> str:
-    """Форматирует секунды в строку HH:MM:SS или MM:SS."""
-    h = seconds // 3600
-    m = (seconds % 3600) // 60
-    s = seconds % 60
-    if h > 0:
-        return f"{h:02d}:{m:02d}:{s:02d}"
-    else:
-        return f"{m:02d}:{s:02d}"
 
 # -----------------------------------------------------------------------------
 # COMMANDS
 # -----------------------------------------------------------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        tr("start_choose_language", "en"),  # Always show initial prompt in both for clarity
+        tr("start_choose_language", "en"),
         parse_mode="Markdown",
         reply_markup=lang_kb(),
     )
@@ -322,16 +303,7 @@ async def language_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.answer()
     lang = q.data.split("_")[1]
     user_languages[q.from_user.id] = lang
-    await q.edit_message_text(
-        tr("language_set", lang), 
-        reply_markup=None # Убираем инлайн клавиатуру после выбора
-    )
-    # Отправляем новое сообщение с главным меню на выбранном языке
-    await context.bot.send_message(
-        chat_id=q.message.chat_id,
-        text=f"{tr('language_set', lang)}\n{tr('prompt_send_link', lang)}", # Добавим сразу просьбу прислать ссылку
-        reply_markup=main_menu(lang)
-    )
+    await q.message.reply_text(tr("language_set", lang), reply_markup=main_menu(lang))
 
 
 async def language_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -367,6 +339,7 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await help_cmd(update, context)
         return
 
+    # Extract video id/url
     vid = None
     m = YOUTUBE_STD_REGEX.search(text)
     if m:
@@ -380,72 +353,15 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(tr("invalid_url", lang), reply_markup=kb)
         return
 
-    status_msg = await update.message.reply_text(tr("fetching_captions", lang), reply_markup=kb)
-    captions = await fetch_transcript(vid, langs=[lang, "en"]) # Запрашиваем на языке пользователя и английском
-    
+    status = await update.message.reply_text(tr("fetching_captions", lang), reply_markup=kb)
+    captions = await fetch_transcript(vid)
     if not captions:
-        await robust_edit(status_msg, tr("subtitles_not_found", lang), context, update, kb)
+        await robust_edit(status, tr("subtitles_not_found", lang), context, update, kb)
         return
 
-    # --- Новая логика формирования транскрипта с редкими метками ---
-    TIME_INTERVAL_SECONDS = 60  # Ставить метку примерно каждые 60 секунд
-    processed_transcript_parts = []
-    current_block_texts = []
-    current_block_start_time_sec = 0 
-    # Инициализируем так, чтобы первая же запись вызвала создание нового блока, если интервал > 0
-    last_timestamped_block_start_time_sec = -TIME_INTERVAL_SECONDS -1 
-
-    if captions: # Убедимся, что субтитры есть
-        # Устанавливаем время начала первого блока из первого субтитра
-        current_block_start_time_sec = captions[0]['start'] 
-    
-        for caption_entry in captions:
-            entry_start_time = caption_entry['start']
-            # Очищаем текст от лишних пробелов и заменяем переносы строк внутри на пробелы
-            entry_text = " ".join(caption_entry['text'].strip().splitlines())
-
-            if not entry_text: # Пропускаем пустые строки после очистки
-                continue
-            
-            # Условие для новой метки: 
-            # 1. Прошло достаточно времени с момента установки последней метки ИЛИ
-            # 2. Это самый первый текстовый блок, который мы добавляем (processed_transcript_parts еще пуст)
-            if (entry_start_time >= last_timestamped_block_start_time_sec + TIME_INTERVAL_SECONDS) or \
-               not processed_transcript_parts :
-                
-                if current_block_texts: # Если есть накопленный текст, завершаем предыдущий блок
-                    block_text_content = " ".join(current_block_texts)
-                    processed_transcript_parts.append(f"[{format_timestamp_hms(current_block_start_time_sec)}] {block_text_content}")
-                
-                # Начинаем новый блок
-                current_block_texts = [entry_text]
-                current_block_start_time_sec = entry_start_time 
-                last_timestamped_block_start_time_sec = entry_start_time # Запоминаем время, когда была установлена метка для этого блока
-            else:
-                # Продолжаем накапливать текст для текущего блока
-                current_block_texts.append(entry_text)
-
-        # Добавляем последний накопленный блок, если он остался
-        if current_block_texts:
-            block_text_content = " ".join(current_block_texts)
-            processed_transcript_parts.append(f"[{format_timestamp_hms(current_block_start_time_sec)}] {block_text_content}")
-
-    transcript = "\n".join(processed_transcript_parts)
-    if not transcript and captions: # Если субтитры были, но все текстовые строки оказались пустыми
-        transcript = "[Транскрипт не содержит текстового содержимого]" if lang == "ru" else "[Transcript contains no textual content]"
-    elif not captions: # Этот случай уже обработан выше, но для полноты
-        transcript = "[Субтитры не найдены]" if lang == "ru" else "[Subtitles not found]"
-    # --- Конец новой логики ---
-
-    if not transcript.strip() or transcript.startswith("["): # Проверка, что транскрипт не пустой и не сообщение об ошибке
-        # Сообщение об отсутствии субтитров или текста уже было отправлено выше или будет заменено
-        # Если captions были, но transcript пуст (например, все строки были пробелами)
-        if captions and not transcript.strip():
-             await robust_edit(status_msg, tr("subtitles_not_found", lang), context, update, kb) # Можно уточнить ошибку
-        # Если captions не было, то subtitles_not_found уже было отправлено.
-        return
-
-
+    transcript = "\n".join(
+        f"[{c['start'] // 60:02d}:{c['start'] % 60:02d}] {c['text']}" for c in captions
+    )
     if len(transcript) > 100000:
         transcript = transcript[:100000] + "\n[truncated]"
 
@@ -456,31 +372,24 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     prompt = f"{instr}\n\nTranscript:\n{transcript}"
 
-    await robust_edit(status_msg, tr("summarizing", lang), context, update, kb)
+    await robust_edit(status, tr("summarizing", lang), context, update, kb)
     try:
         rsp = await openai.ChatCompletion.acreate(
-            model="gpt-4o", # Рекомендую использовать более новую модель, если возможно, например gpt-4o или gpt-4-turbo
+            model="gpt-4.1",
             messages=[
                 {
                     "role": "system",
-                    "content": "You are best in the world video summarizer. Preserve maximum details. Timestamps in your summary should correspond to the timestamps provided in the transcript.",
+                    "content": "You are best in the world video summarizer. Preserve maximum details.",
                 },
                 {"role": "user", "content": prompt},
             ],
-            max_tokens=1000, # Можно увеличить, если ожидаются длинные аннотации
+            max_tokens=800,
             temperature=0.5,
         )
         summ = rsp.choices[0].message.content.strip()
-        # Проверка на слишком длинный ответ для Telegram (макс. 4096 символов)
-        if len(summ) > 4096:
-            await robust_edit(status_msg, summ[:4090] + "\n[...]", context, update, kb, md="Markdown") # Обрезаем и отправляем
-            # Можно добавить логику отправки остальной части в новом сообщении, если это необходимо
-        else:
-            await robust_edit(status_msg, summ, context, update, kb, md="Markdown")
-
+        await robust_edit(status, summ, context, update, kb, md="Markdown")
     except Exception as e:  # noqa: BLE001
-        logger.error(f"OpenAI API error: {e}", exc_info=True)
-        await robust_edit(status_msg, f"{tr('openai_error', lang)} {type(e).__name__}: {e}", context, update, kb)
+        await robust_edit(status, f"{tr('openai_error', lang)} {e}", context, update, kb)
 
 
 # -----------------------------------------------------------------------------
@@ -494,14 +403,9 @@ if __name__ == "__main__":
     app.add_handler(CallbackQueryHandler(language_button, pattern="^lang_"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle))
 
-    # Для локального тестирования можно закомментировать вебхук и использовать app.run_polling()
-    # logger.info("Starting polling...")
-    # app.run_polling(drop_pending_updates=True)
-
-    # Настройки для вебхука (если разворачиваете на сервере)
-    webhook_path = f"/{BOT_TOKEN.split(':')[-1]}" # Более безопасный способ получить часть токена для пути
+    webhook_path = f"/{BOT_TOKEN.split(':')[-1]}"
     webhook_url = APP_URL.rstrip("/") + webhook_path
-    logger.info("Starting webhook at %s on port %d", webhook_url, PORT)
+    logger.info("Starting webhook at %s", webhook_url)
 
     app.run_webhook(
         listen="0.0.0.0",
