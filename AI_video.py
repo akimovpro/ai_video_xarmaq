@@ -3,8 +3,8 @@ import logging
 import re
 import httpx
 import openai
-import asyncio  # Для запуска блокирующих операций в executor'е
-import yt_dlp    # Библиотека для работы с YouTube (субтитры и пр.)
+import asyncio
+import yt_dlp
 
 from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup,
@@ -31,10 +31,10 @@ PORT           = int(os.getenv('PORT', '443'))
 if not BOT_TOKEN or not OPENAI_API_KEY or not APP_URL:
     raise RuntimeError('BOT_TOKEN, OPENAI_API_KEY, and APP_URL must be set')
 
-openai.api_key = OPENAI_API_KEY   # Настройка ключа (без прокси — он не нужен)
+openai.api_key = OPENAI_API_KEY
 
 # -----------------------------------------------------------------------------
-# SOCKS5 PROXY (только для yt-dlp): логин/пароль берём из переменных окружения
+# SOCKS5 PROXY (yt‑dlp only)
 # -----------------------------------------------------------------------------
 YTDLP_PROXY_USER = os.getenv('YTDLP_PROXY_USER')
 YTDLP_PROXY_PASS = os.getenv('YTDLP_PROXY_PASS')
@@ -48,7 +48,6 @@ YTDLP_PROXY_URL = (
     f"socks5h://{YTDLP_PROXY_USER}:{YTDLP_PROXY_PASS}"
     f"@{YTDLP_PROXY_HOST}:{YTDLP_PROXY_PORT}"
 )
-# -----------------------------------------------------------------------------
 
 # -----------------------------------------------------------------------------
 # LOGGING
@@ -77,281 +76,212 @@ YOUTUBE_GOOGLEUSERCONTENT_NUMERIC_REGEX = re.compile(
 )
 
 # -----------------------------------------------------------------------------
-# SRT & VTT PARSERS
+# CAPTION PARSERS (SRT + VTT)
 # -----------------------------------------------------------------------------
 SRT_PATTERN = re.compile(
-    r"^\d+\s*?\n"  # cue number
-    r"(\d{2}:\d{2}:\d{2},\d{3})\s*-->\s*"  # start
-    r"(\d{2}:\d{2}:\d{2},\d{3})\s*?\n"     # end (не используем)
-    r"(.+?)\s*?(\n\n|\Z)",
+    r"^\d+\s*?\n(\d{2}:\d{2}:\d{2},\d{3})\s*-->.*?\n(.+?)\s*?(?:\n\n|\Z)",
     re.S | re.M
 )
-
 VTT_TS_RE = re.compile(r"(?P<h>\d{2,}):(?P<m>\d{2}):(?P<s>\d{2})\.(?P<ms>\d{3})")
 
-def _timestamp_to_seconds(h: int, m: int, s: int) -> int:
+def _ts2sec(h: int, m: int, s: int) -> int:
     return h * 3600 + m * 60 + s
 
-
-def parse_srt_content(text: str, logger_obj=None) -> list | None:
-    """Парсит SRT и возвращает [{'start': seconds, 'text': str}, …]."""
+def parse_srt(text: str) -> list:
     entries = []
-    for match in SRT_PATTERN.finditer(text):
-        try:
-            start_str = match.group(1)
-            body      = match.group(3)
-            h, m, s = map(int, start_str.split(',')[0].split(':'))
-            start_seconds = _timestamp_to_seconds(h, m, s)
-            clean_text = " ".join(line.strip() for line in body.strip().splitlines() if line.strip())
-            if clean_text:
-                entries.append({'start': start_seconds, 'text': clean_text})
-        except Exception as e:
-            if logger_obj:
-                logger_obj.error(f"SRT parse error: {e}")
-    return entries or None
+    for m in SRT_PATTERN.finditer(text):
+        start = m.group(1).split(',')[0]
+        h, mi, s = map(int, start.split(':'))
+        body = " ".join(line.strip() for line in m.group(2).splitlines() if line.strip())
+        if body:
+            entries.append({'start': _ts2sec(h, mi, s), 'text': body})
+    return entries
 
-
-def parse_vtt_content(text: str, logger_obj=None) -> list | None:
-    """Очень простой VTT‑парсер suficiente для bullet‑summary."""
-    lines = text.strip().splitlines()
+def parse_vtt(text: str) -> list:
     entries = []
+    lines = text.splitlines()
     i = 0
     while i < len(lines):
-        line = lines[i].strip()
-        if "-->" in line:
-            try:
-                ts_str = line.split("-->")[0].strip()
-                m = VTT_TS_RE.search(ts_str)
-                if not m:
-                    i += 1; continue
-                h = int(m.group('h'))
-                m_ = int(m.group('m'))
-                s_ = int(m.group('s'))
-                start_seconds = _timestamp_to_seconds(h, m_, s_)
-                # Collect text until blank line
+        if '-->' in lines[i]:
+            ts = lines[i].split('-->')[0].strip()
+            m = VTT_TS_RE.search(ts)
+            i += 1
+            body_lines = []
+            while i < len(lines) and lines[i].strip():
+                body_lines.append(lines[i].strip())
                 i += 1
-                text_lines = []
-                while i < len(lines) and lines[i].strip():
-                    text_lines.append(lines[i].strip())
-                    i += 1
-                clean_text = " ".join(text_lines).strip()
-                if clean_text:
-                    entries.append({'start': start_seconds, 'text': clean_text})
-            except Exception as e:
-                if logger_obj:
-                    logger_obj.error(f"VTT parse error at line {i}: {e}")
+            if m and body_lines:
+                h, mi, s = int(m.group('h')), int(m.group('m')), int(m.group('s'))
+                entries.append({'start': _ts2sec(h, mi, s), 'text': " ".join(body_lines)})
         i += 1
-    return entries or None
+    return entries
 
-# unified function
-
-def parse_captions(text: str, ext: str, logger_obj=None):
-    if ext == 'srt':
-        return parse_srt_content(text, logger_obj)
-    if ext == 'vtt':
-        return parse_vtt_content(text, logger_obj)
-    return None
+def parse_captions(text: str, ext: str) -> list | None:
+    return parse_srt(text) if ext == 'srt' else parse_vtt(text) if ext == 'vtt' else None
 
 # -----------------------------------------------------------------------------
-# FETCH TRANSCRIPT WITH yt-dlp (через SOCKS5-proxy)
+# FETCH CAPTIONS WITH yt‑dlp (SOCKS5)
 # -----------------------------------------------------------------------------
-async def fetch_transcript_with_yt_dlp(
-    video_url_or_id: str,
-    target_langs: list[str] | None = None,
-    logger_obj=logger
-) -> list | None:
-    target_langs = target_langs or ['ru', 'en']
-
-    if logger_obj:
-        logger_obj.info(
-            f"yt-dlp: Запрос субтитров для '{video_url_or_id}' (langs={target_langs})"
-        )
-
+async def fetch_transcript(video_id_or_url: str, langs: list[str] = None) -> list | None:
+    langs = langs or ['ru', 'en']
     ydl_opts = {
-        'writesubtitles'    : True,
-        'writeautomaticsub' : True,
-        'subtitleslangs'    : target_langs,
-        'subtitlesformat'   : 'best',       # пусть выбирает srt/vtt
-        'skip_download'     : True,
-        'quiet'             : True,
-        'noplaylist'        : True,
-        'noprogress'        : True,
-        'logger'            : logger_obj,
-        'extract_flat'      : 'in_playlist',
-        'ignoreerrors'      : True,
-        'proxy'             : YTDLP_PROXY_URL,
+        'writesubtitles': True,
+        'writeautomaticsub': True,
+        'subtitleslangs': langs,
+        'subtitlesformat': 'best',
+        'skip_download': True,
+        'quiet': True,
+        'proxy': YTDLP_PROXY_URL,
+        'logger': logger,
     }
-
-    try:
-        loop = asyncio.get_running_loop()
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info_dict = await loop.run_in_executor(
-                None, lambda: ydl.extract_info(video_url_or_id, download=False)
-            )
-
-        if not info_dict:
-            logger_obj.warning("yt-dlp: extract_info вернул None")
-            return None
-
-        logger_obj.info(
-            f"yt-dlp: Обработано видео '{info_dict.get('title', 'N/A')}' (ID: {info_dict.get('id')})"
-        )
-
-        # Подбираем субтитры: сначала SRT, затем VTT
-        def find_caption(lang_pool: dict, preferred_exts):
-            for lang in target_langs:
-                for ext in preferred_exts:
-                    for item in lang_pool.get(lang, []):
-                        if item.get('ext') == ext and item.get('url'):
-                            return item['url'], ext
-            return None, None
-
-        url, ext = find_caption(info_dict.get('subtitles', {}), ['srt', 'vtt'])
-        if not url:
-            url, ext = find_caption(info_dict.get('automatic_captions', {}), ['srt', 'vtt'])
-
-        if not url:
-            logger_obj.warning("yt-dlp: Subtitles not found in any supported format (srt/vtt)")
-            return None
-
-        logger_obj.info(f"yt-dlp: Загрузка {ext.upper()} субтитров: {url[:100]}…")
-
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            resp = await client.get(url)
-            resp.raise_for_status()
-            captions_text = resp.text
-
-        return parse_captions(captions_text, ext, logger_obj)
-
-    except yt_dlp.utils.DownloadError as e:
-        logger_obj.error(f"yt-dlp DownloadError: {e}")
-    except httpx.HTTPStatusError as e:
-        logger_obj.error(f"HTTPStatusError при скачивании субтитров: {e}")
-    except Exception as e:
-        logger_obj.error(f"Общая ошибка yt-dlp: {type(e).__name__}: {e}")
-    return None
-
-# -----------------------------------------------------------------------------
-# ROBUST EDIT (без изменений)
-# -----------------------------------------------------------------------------
-async def robust_edit_text(
-    message_to_edit: Message | None,
-    new_text: str,
-    context: ContextTypes.DEFAULT_TYPE,
-    update_for_fallback: Update,
-    reply_markup: InlineKeyboardMarkup | ReplyKeyboardMarkup | None,
-    parse_mode: str | None = None
-) -> Message | None:
-    if message_to_edit:
-        try:
-            await message_to_edit.edit_text(
-                new_text, reply_markup=reply_markup, parse_mode=parse_mode
-            )
-            return message_to_edit
-        except TelegramBadRequest as e:
-            if "Message is not modified" in str(e):
-                logger.info(f"Message {message_to_edit.message_id} not modified.")
-                return message_to_edit
-            logger.warning(
-                f"Failed to edit message {message_to_edit.message_id} (error: {e}). Sending new."
-            )
-        except Exception as e:
-            logger.error(
-                f"Unexpected error editing {message_to_edit.message_id}: {e}. Sending new."
-            )
-    else:
-        logger.warning("robust_edit_text called with None message_to_edit. Sending new.")
-
-    try:
-        return await context.bot.send_message(
-            chat_id=update_for_fallback.effective_chat.id,
-            text=new_text,
-            reply_markup=reply_markup,
-            parse_mode=parse_mode,
-        )
-    except Exception as e_send:
-        logger.error(f"Failed to send fallback message: {e_send}")
+    loop = asyncio.get_running_loop()
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = await loop.run_in_executor(None, lambda: ydl.extract_info(video_id_or_url, download=False))
+    if not info:
         return None
+    def pick(pool):
+        for lang in langs:
+            for ext in ['srt', 'vtt']:
+                for it in pool.get(lang, []):
+                    if it.get('ext') == ext and it.get('url'):
+                        return it['url'], ext
+        return None, None
+    url, ext = pick(info.get('subtitles', {}))
+    if not url:
+        url, ext = pick(info.get('automatic_captions', {}))
+    if not url:
+        return None
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        r = await client.get(url)
+        r.raise_for_status()
+    return parse_captions(r.text, ext)
 
 # -----------------------------------------------------------------------------
-# UI HELPERS
+# HELPERS
 # -----------------------------------------------------------------------------
+async def robust_edit(msg: Message | None, text: str, ctx, upd, kb, md=None):
+    if msg:
+        try:
+            await msg.edit_text(text, reply_markup=kb, parse_mode=md)
+            return msg
+        except TelegramBadRequest:
+            pass
+    return await ctx.bot.send_message(upd.effective_chat.id, text, reply_markup=kb, parse_mode=md)
 
-def get_main_menu(lang: str) -> ReplyKeyboardMarkup:
-    labels = {
+# UI keyboards
+
+def main_menu(lang):
+    m = {
         'en': ['📺 Summarize Video', '🌐 Change Language', '❓ Help'],
-        'ru': ['📺 Аннотировать видео', '🌐 Сменить язык', '❓ Помощь'],
+        'ru': ['📺 Аннотировать видео', '🌐 Сменить язык', '❓ Помощь']
     }
-    return ReplyKeyboardMarkup(
-        [[lbl] for lbl in labels.get(lang, labels['en'])], resize_keyboard=True
-    )
+    return ReplyKeyboardMarkup([[b] for b in m.get(lang, m['en'])], resize_keyboard=True)
 
-
-def get_lang_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton('🇬🇧 English', callback_data='lang_en'),
-        InlineKeyboardButton('🇷🇺 Русский', callback_data='lang_ru'),
-    ]])
+def lang_kb():
+    return InlineKeyboardMarkup([[InlineKeyboardButton('🇬🇧 English', callback_data='lang_en'),
+                                  InlineKeyboardButton('🇷🇺 Русский', callback_data='lang_ru')]])
 
 # -----------------------------------------------------------------------------
-# COMMAND HANDLERS
+# COMMANDS
 # -----------------------------------------------------------------------------
-
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        '🎉 *Welcome!* Select language / Выберите язык:',
-        parse_mode='Markdown', reply_markup=get_lang_keyboard()
-    )
+    await update.message.reply_text('🎉 *Welcome!* Select language / Выберите язык:', parse_mode='Markdown', reply_markup=lang_kb())
 
 async def language_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
+    q = update.callback_query; await q.answer()
     lang = q.data.split('_')[1]
     user_languages[q.from_user.id] = lang
-    msg = '🌟 Language set to English!' if lang == 'en' else '🌟 Язык установлен: Русский!'
-    await q.message.reply_text(msg, parse_mode='Markdown', reply_markup=get_main_menu(lang))
+    txt = '🌟 Language set to English!' if lang == 'en' else '🌟 Язык установлен: Русский!'
+    await q.message.reply_text(txt, reply_markup=main_menu(lang))
 
 async def language_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        '🌐 Select language / Выберите язык:',
-        parse_mode='Markdown',
-        reply_markup=get_lang_keyboard()
-    )
+    await update.message.reply_text('🌐 Select language / Выберите язык:', reply_markup=lang_kb())
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lang = user_languages.get(update.effective_user.id, 'en')
-    text_en = ('1️⃣ Send YouTube link (standard or googleusercontent.com/youtube.com/NUMERIC_ID format)\n'
-               '2️⃣ Receive bullet points + narrative summary\n'
-               '3️⃣ /language to change language')
-    text_ru = ('1️⃣ Отправьте ссылку YouTube (стандартного формата или googleusercontent.com/youtube.com/ЧИСЛОВОЙ_ID)\n'
-               '2️⃣ Получите пункты + пересказ\n'
-               '3️⃣ /language для смены языка')
-    await update.message.reply_text(
-        text_en if lang == 'en' else text_ru,
-        parse_mode='Markdown',
-        reply_markup=get_main_menu(lang)
-    )
+    en = '1️⃣ Send YouTube link\n2️⃣ Get summary\n3️⃣ /language to change language'
+    ru = '1️⃣ Отправьте ссылку YouTube\n2️⃣ Получите аннотацию\n3️⃣ /language для смены языка'
+    await update.message.reply_text(en if lang == 'en' else ru, reply_markup=main_menu(lang))
 
 # -----------------------------------------------------------------------------
 # MESSAGE HANDLER
 # -----------------------------------------------------------------------------
-
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid  = update.effective_user.id
+async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
     lang = user_languages.get(uid)
-
     if not lang:
         await update.message.reply_text('Please select a language first using /start or /language.')
         return
+    text = update.message.text.strip()
+    kb = main_menu(lang)
 
-    text_input = update.message.text.strip()
-    menu       = get_main_menu(lang)
+    if text in ['📺 Summarize Video', '📺 Аннотировать видео']:
+        prompt = 'Please send a YouTube link:' if lang == 'en' else 'Отправьте ссылку на видео:'
+        await update.message.reply_text(prompt, reply_markup=kb); return
+    if text in ['🌐 Change Language', '🌐 Сменить язык']:
+        await language_cmd(update, context); return
+    if text in ['❓ Help', '❓ Помощь']:
+        await help_cmd(update, context); return
 
-    # UI buttons
-    if text_input in ['📺 Summarize Video', '📺 Аннотировать видео']:
-        await update.message.reply_text(
-            'Please send me a YouTube video link to summarize:' if lang == 'en'
-            else 'Пожалуйста, отправьте ссылку на видео для аннотации:',
-            reply_markup=menu
-        ); return
-    if text_input in ['🌐 Change Language
+    # Extract video id/url
+    vid = None
+    m = YOUTUBE_STD_REGEX.search(text)
+    if m:
+        vid = m.group(1)
+    else:
+        m = YOUTUBE_GOOGLEUSERCONTENT_NUMERIC_REGEX.search(text)
+        if m:
+            vid = m.group(1)
+    if not vid:
+        await update.message.reply_text('Invalid YouTube URL.' if lang == 'en' else 'Недействительная ссылка.', reply_markup=kb)
+        return
+
+    status = await update.message.reply_text('🔄 Fetching captions…', reply_markup=kb)
+    captions = await fetch_transcript(vid)
+    if not captions:
+        await robust_edit(status, 'Subtitles not found.' if lang == 'en' else 'Субтитры не найдены.', context, update, kb)
+        return
+
+    # Build transcript
+    transcript = "\n".join(f"[{c['start']//60:02d}:{c['start']%60:02d}] {c['text']}" for c in captions)
+    if len(transcript) > 10000:
+        transcript = transcript[:10000] + '\n[truncated]'
+
+    instr = (
+        'List 3‑7 bullet points (with timestamps) then a 2‑3 paragraph summary.' if lang == 'en'
+        else 'Сначала 3‑7 пунктов с таймкодами, затем 2‑3 абзаца пересказа.'
+    )
+    prompt = f"{instr}\n\nTranscript:\n{transcript}"
+
+    await robust_edit(status, '📝 Summarizing…', context, update, kb)
+    try:
+        rsp = await openai.ChatCompletion.acreate(
+            model='gpt-3.5-turbo',
+            messages=[
+                {'role': 'system', 'content': 'You summarize video transcripts.'},
+                {'role': 'user', 'content': prompt}
+            ],
+            max_tokens=800,
+            temperature=0.5
+        )
+        summ = rsp.choices[0].message.content.strip()
+        await robust_edit(status, summ, context, update, kb, md='Markdown')
+    except Exception as e:
+        await robust_edit(status, f"OpenAI error: {e}", context, update, kb)
+
+# -----------------------------------------------------------------------------
+# ENTRYPOINT
+# -----------------------------------------------------------------------------
+if __name__ == '__main__':
+    app = Application.builder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler('start', start))
+    app.add_handler(CommandHandler('language', language_cmd))
+    app.add_handler(CommandHandler('help', help_cmd))
+    app.add_handler(CallbackQueryHandler(language_button, pattern='^lang_'))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle))
+
+    webhook_path = f"/{BOT_TOKEN.split(':')[-1]}"
+    webhook_url  = APP_URL.rstrip('/') + webhook_path
+    logger.info(f"Starting webhook at {webhook_url}")
+
+    app.run_webhook(listen='0.0.0.0', port=PORT,	url_path=webhook_path, webhook_url=webhook_url, drop_pending_updates=True)
