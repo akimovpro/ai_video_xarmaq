@@ -99,33 +99,82 @@ def fetch_transcript(vid: str):
 # Main message handler
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
+    logger.info(f"handle_message invoked for user {uid}")
     lang = user_languages.get(uid)
+    logger.info(f"User language: {lang}")
     text = update.message.text.strip()
+    logger.info(f"Received text: {text}")
     menu = get_main_menu(lang) if lang else None
 
     if not lang:
+        logger.info("No language set, prompting start")
         return await update.message.reply_text('Please /start and select language first.')
     if text in ['📺 Summarize Video','📺 Аннотировать видео']:
+        logger.info("User requested summary prompt")
         prompt = 'Send YouTube link:' if lang=='en' else 'Отправьте ссылку:'
         return await update.message.reply_text(prompt, reply_markup=menu)
     if text in ['🌐 Change Language','🌐 Сменить язык']:
+        logger.info("User requested language change")
         return await language_cmd(update, context)
     if text in ['❓ Help','❓ Помощь']:
+        logger.info("User requested help")
         return await help_cmd(update, context)
 
     m = re.search(YOUTUBE_REGEX, text)
+    logger.info(f"Regex match: {m}")
     if not m:
         err = 'Invalid URL.' if lang=='en' else 'Недействительная ссылка.'
+        logger.info("Invalid URL provided")
         return await update.message.reply_text(err, reply_markup=menu)
     vid = m.group(1)
+    logger.info(f"Extracted video ID: {vid}")
 
-    await update.message.reply_text('Processing...⏳' if lang=='en' else 'Обработка...⏳', reply_markup=menu)
+    msg = 'Processing...⏳' if lang=='en' else 'Обработка...⏳'
+    await update.message.reply_text(msg, reply_markup=menu)
+    logger.info("Sent processing message")
+
     trans = fetch_transcript(vid)
+    logger.info(f"Fetched transcript: {'found' if trans else 'none'}")
     if not trans:
-        msg = 'No transcript.' if lang=='en' else 'Субтитры недоступны.'
-        return await update.message.reply_text(msg, reply_markup=menu)
+        msg2 = 'No transcript.' if lang=='en' else 'Субтитры недоступны.'
+        logger.info("Transcript unavailable, notifying user")
+        return await update.message.reply_text(msg2, reply_markup=menu)
 
     # Build transcript text
+    segs = []
+    for e in trans:
+        s = int(e['start']); t = e['text']
+        mns, secs = divmod(s, 60)
+        segs.append(f"[{mns:02d}:{secs:02d}] {t}")
+    full = "
+".join(segs)
+    logger.info(f"Built full transcript text, length {len(full)}")
+
+    # AI prompt
+    if lang=='en':
+        instr = ('List key bullet points with timestamps. '
+                 'Then 2-3 paragraph summary starting each with timestamp.')
+    else:
+        instr = ('Сначала пункты с таймкодами. '
+                 'Затем 2-3 абзаца пересказа с таймкодами.')
+    prompt = instr + "
+
+" + full
+    logger.info(f"Constructed AI prompt, length {len(prompt)}")
+
+    try:
+        res = openai.ChatCompletion.create(
+            model='gpt-3.5-turbo',
+            messages=[{'role':'user','content':prompt}], max_tokens=600
+        )
+        out = res.choices[0].message.content
+        logger.info("Received AI response")
+    except Exception as e:
+        logger.error(f'AI error: {e}')
+        return await update.message.reply_text('Error.', reply_markup=menu)
+
+    await update.message.reply_text(out, parse_mode='Markdown', reply_markup=menu)
+    logger.info("Sent final summary to user")
     segs = []
     for e in trans:
         s = int(e['start']); t = e['text']
