@@ -2,3 +2,4 @@ python-telegram-bot[webhooks]~=20.5
 youtube-transcript-api~=0.6.0
 openai~=0.27.0
 httpx~=0.24.0
+pytube~=15.0.0
