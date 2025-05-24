@@ -3,6 +3,9 @@ import logging
 import re
 import httpx
 import openai
+import asyncio # Для запуска блокирующих операций в executor'е
+import yt_dlp # Новая библиотека для субтитров
+
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, Message
 from telegram.ext import (
     Application,
@@ -12,12 +15,9 @@ from telegram.ext import (
     filters,
     ContextTypes,
 )
-from telegram.error import BadRequest as TelegramBadRequest # Импортируем для явного отлова
+from telegram.error import BadRequest as TelegramBadRequest
 
-from youtube_transcript_api import YouTubeTranscriptApi
-from pytube import YouTube
-
-# Load environment variables
+# Загрузка переменных окружения (как и раньше)
 BOT_TOKEN = os.getenv('BOT_TOKEN')
 OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
 APP_URL = os.getenv('APP_URL')
@@ -26,16 +26,17 @@ PORT = int(os.getenv('PORT', '443'))
 if not BOT_TOKEN or not OPENAI_API_KEY or not APP_URL:
     raise RuntimeError('BOT_TOKEN, OPENAI_API_KEY, and APP_URL must be set')
 
-# Initialize OpenAI
+# Инициализация OpenAI (как и раньше)
 openai.api_key = OPENAI_API_KEY
 
-# Logging
+# Логирование (как и раньше)
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# User language preferences
+# Пользовательские языковые предпочтения (как и раньше)
 user_languages = {}
 
+# Регулярные выражения для URL (как и раньше)
 YOUTUBE_STD_REGEX = re.compile(
     r'(?:https?://)?(?:www\.)?'
     r'(?:youtube\.com/(?:watch\?v=|shorts/|live/|embed/|v/)|youtu\.be/)'
@@ -45,53 +46,174 @@ YOUTUBE_GOOGLEUSERCONTENT_NUMERIC_REGEX = re.compile(
     r'(https?://(?:www\.)?googleusercontent\.com/youtube\.com/([0-9]+))'
 )
 
-# Helper function for robust message editing
+# --- Начало новой части: Парсер SRT и функция для yt-dlp ---
+
+def parse_srt_content(srt_text: str, logger_obj=None) -> list | None:
+    """Парсит содержимое SRT файла и возвращает список словарей с временем начала и текстом."""
+    entries = []
+    # Паттерн для SRT: номер, временные метки, текст (многострочный)
+    # \s*? делает пробелы опциональными и нежадными
+    pattern = re.compile(
+        r"^\d+\s*?\n"
+        r"(\d{2}:\d{2}:\d{2},\d{3})\s*-->\s*(\d{2}:\d{2}:\d{2},\d{3})\s*?\n"
+        r"(.+?)\s*?(\n\n|\Z)",
+        re.S | re.M # re.S для точки, соответствующей новой строке в тексте, re.M для ^ в начале каждой строки
+    )
+    for match in pattern.finditer(srt_text):
+        try:
+            start_time_str = match.group(1) # HH:MM:SS,mmm
+            raw_text_block = match.group(3)
+
+            # Очистка текстового блока: удалить лишние пробелы и объединить строки через один пробел
+            text_lines = [line.strip() for line in raw_text_block.strip().splitlines() if line.strip()]
+            text_content = " ".join(text_lines)
+
+            time_parts = start_time_str.split(',')
+            h_m_s = time_parts[0].split(':')
+            
+            h = int(h_m_s[0])
+            mn = int(h_m_s[1])
+            s = int(h_m_s[2])
+            # ms = int(time_parts[1]) # Миллисекунды пока не используются для `start`
+            
+            start_seconds = h * 3600 + mn * 60 + s
+            
+            if text_content: # Добавляем только если есть текст
+                entries.append({'start': start_seconds, 'text': text_content})
+        except Exception as e:
+            if logger_obj:
+                # Логируем только часть блока, чтобы не засорять логи слишком сильно
+                logger_obj.error(f"Ошибка парсинга SRT блока: '{match.group(0)[:150].replace(chr(10), ' ')}...' -> {e}")
+            continue # Пропускаем блок с ошибкой
+    
+    if not entries and srt_text: # Если парсинг ничего не дал, но текст был
+         if logger_obj: logger_obj.warning("SRT контент был, но парсинг не дал записей. Проверьте формат SRT / паттерн.")
+    return entries if entries else None
+
+
+async def fetch_transcript_with_yt_dlp(video_url_or_id: str, target_langs=['ru', 'en'], logger_obj=logger) -> list | None:
+    """
+    Получает субтитры с помощью yt-dlp как Python модуль.
+    video_url_or_id: Полный URL видео или 11-значный ID.
+    target_langs: Список предпочитаемых языков ['ru', 'en'].
+    logger_obj: Экземпляр логгера.
+    """
+    if logger_obj: logger_obj.info(f"yt-dlp: Запрос субтитров для '{video_url_or_id}' на языках: {target_langs}")
+
+    ydl_opts = {
+        'writesubtitles': True,        # Включить запись субтитров (если доступны)
+        'writeautomaticsub': True,   # Включить запись автоматических субтитров
+        'subtitleslangs': target_langs,  # Предпочитаемые языки ['ru', 'en', 'en-US', etc.]
+        'subtitlesformat': 'srt',      # Желаемый формат субтитров
+        'skip_download': True,         # Не скачивать само видео
+        'quiet': True,                 # Меньше вывода от yt-dlp
+        'noplaylist': True,            # Не обрабатывать плейлисты
+        'noprogress': True,            # Не показывать прогресс-бар
+        'logger': logger_obj,          # Использовать наш логгер
+        'extract_flat': 'in_playlist', # Не извлекать информацию о каждом видео в плейлисте, если передан плейлист
+        'ignoreerrors': True,          # Продолжать при ошибках с отдельными видео (если это плейлист)
+    }
+
+    try:
+        # yt_dlp.YoutubeDL.extract_info() - это блокирующая операция.
+        # Запускаем её в отдельном потоке, чтобы не блокировать asyncio event loop.
+        loop = asyncio.get_running_loop()
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            # Оборачиваем блокирующий вызов ydl.extract_info
+            info_dict = await loop.run_in_executor(
+                None,  # Использует ThreadPoolExecutor по умолчанию
+                lambda: ydl.extract_info(video_url_or_id, download=False)
+            )
+
+        if not info_dict:
+            if logger_obj: logger_obj.warning(f"yt-dlp: extract_info не вернул информацию для '{video_url_or_id}'")
+            return None
+
+        video_id_extracted = info_dict.get('id', 'N/A')
+        if logger_obj: logger_obj.info(f"yt-dlp: Обработано видео: '{info_dict.get('title', 'N/A')}' (ID: {video_id_extracted})")
+
+        chosen_sub_url = None
+        chosen_lang_type = "" # "manual" or "auto"
+
+        # Ищем субтитры в порядке предпочтения языков
+        for lang_code in target_langs:
+            # 1. Проверяем созданные вручную субтитры
+            if lang_code in info_dict.get('subtitles', {}):
+                for sub_info in info_dict['subtitles'][lang_code]:
+                    if sub_info.get('ext') == 'srt' and sub_info.get('url'):
+                        chosen_sub_url = sub_info['url']
+                        chosen_lang_type = "manual"
+                        if logger_obj: logger_obj.info(f"yt-dlp: Найдены ручные SRT для '{lang_code}'")
+                        break
+            if chosen_sub_url: break
+
+            # 2. Проверяем автоматические субтитры, если ручные не найдены для этого языка
+            if lang_code in info_dict.get('automatic_captions', {}):
+                for sub_info in info_dict['automatic_captions'][lang_code]:
+                    if sub_info.get('ext') == 'srt' and sub_info.get('url'):
+                        chosen_sub_url = sub_info['url']
+                        chosen_lang_type = "auto"
+                        if logger_obj: logger_obj.info(f"yt-dlp: Найдены автоматические SRT для '{lang_code}'")
+                        break
+            if chosen_sub_url: break
+        
+        if not chosen_sub_url:
+            if logger_obj: logger_obj.warning(f"yt-dlp: SRT субтитры на языках {target_langs} не найдены для '{video_url_or_id}'")
+            return None
+
+        if logger_obj: logger_obj.info(f"yt-dlp: Загрузка {chosen_lang_type} SRT субтитров с URL: {chosen_sub_url[:100]}...")
+        
+        async with httpx.AsyncClient(timeout=20.0) as client: # Увеличим таймаут для скачивания
+            response = await client.get(chosen_sub_url)
+            response.raise_for_status() # Вызовет исключение для HTTP ошибок 4xx/5xx
+            srt_content = response.text
+        
+        if not srt_content:
+            if logger_obj: logger_obj.warning(f"yt-dlp: Скачанный SRT контент пуст для '{video_url_or_id}'")
+            return None
+
+        return parse_srt_content(srt_content, logger_obj)
+
+    except yt_dlp.utils.DownloadError as e:
+        # Эта ошибка часто содержит полезную информацию, например, "subtitles not available"
+        if logger_obj: logger_obj.error(f"yt-dlp DownloadError для '{video_url_or_id}': {str(e)}")
+        return None
+    except httpx.HTTPStatusError as e:
+        if logger_obj: logger_obj.error(f"yt-dlp: Ошибка HTTP при скачивании субтитров для '{video_url_or_id}': {e}")
+        return None
+    except Exception as e:
+        if logger_obj: logger_obj.error(f"yt-dlp: Общая ошибка при получении субтитров для '{video_url_or_id}': {type(e).__name__} - {e}")
+        return None
+
+# --- Конец новой части ---
+
+# Вспомогательная функция для редактирования сообщений (без изменений)
 async def robust_edit_text(
-    message_to_edit: Message | None,
-    new_text: str,
-    context: ContextTypes.DEFAULT_TYPE,
-    update_for_fallback: Update, # Нужен для chat_id, если придется отправлять новое сообщение
-    reply_markup: InlineKeyboardMarkup | ReplyKeyboardMarkup | None,
+    message_to_edit: Message | None, new_text: str, context: ContextTypes.DEFAULT_TYPE,
+    update_for_fallback: Update, reply_markup: InlineKeyboardMarkup | ReplyKeyboardMarkup | None,
     parse_mode: str | None = None
 ) -> Message | None:
-    """
-    Tries to edit a message. If it fails (e.g., message too old),
-    sends a new message instead. Returns the (potentially new) message object or None.
-    """
     if message_to_edit:
         try:
             await message_to_edit.edit_text(new_text, reply_markup=reply_markup, parse_mode=parse_mode)
             return message_to_edit
         except TelegramBadRequest as e:
             if "Message is not modified" in str(e):
-                logger.info(f"Message {message_to_edit.message_id} not modified, no need to edit.")
+                logger.info(f"Message {message_to_edit.message_id} not modified.")
                 return message_to_edit
-            else:
-                logger.warning(
-                    f"Failed to edit message {message_to_edit.message_id} (error: {e}). Sending new message."
-                )
-        except Exception as e: # Catch other potential errors during edit
-            logger.error(
-                f"Unexpected error editing message {message_to_edit.message_id}: {e}. Sending new message."
-            )
-    else:
-        logger.warning("robust_edit_text called with None message_to_edit. Sending new message.")
-
-    # Fallback: send a new message
+            else: logger.warning(f"Failed to edit message {message_to_edit.message_id} (error: {e}). Sending new.")
+        except Exception as e: logger.error(f"Unexpected error editing {message_to_edit.message_id}: {e}. Sending new.")
+    else: logger.warning("robust_edit_text called with None message_to_edit. Sending new.")
     try:
-        new_msg = await context.bot.send_message(
-            chat_id=update_for_fallback.effective_chat.id,
-            text=new_text,
-            reply_markup=reply_markup,
-            parse_mode=parse_mode
+        return await context.bot.send_message(
+            chat_id=update_for_fallback.effective_chat.id, text=new_text,
+            reply_markup=reply_markup, parse_mode=parse_mode
         )
-        return new_msg
     except Exception as e_send:
         logger.error(f"Failed to send fallback message: {e_send}")
         return None
 
-
-# Keyboards
+# Клавиатуры и обработчики команд (без существенных изменений, кроме вызова fetch_transcript)
 def get_main_menu(lang: str) -> ReplyKeyboardMarkup:
     labels = {
         'en': ['📺 Summarize Video', '🌐 Change Language', '❓ Help'],
@@ -107,7 +229,6 @@ def get_lang_keyboard() -> InlineKeyboardMarkup:
     ]]
     return InlineKeyboardMarkup(kb)
 
-# Handlers
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         '🎉 *Welcome!* Select language / Выберите язык:',
@@ -115,19 +236,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def language_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    uid = q.from_user.id
-    lang = q.data.split('_')[1]
-    user_languages[uid] = lang
+    q = update.callback_query; await q.answer()
+    lang = q.data.split('_')[1]; user_languages[q.from_user.id] = lang
     msg = '🌟 Language set to English!' if lang=='en' else '🌟 Язык установлен: Русский!'
-    # Send as a new message, then delete the one with inline keyboard if desired
     await q.message.reply_text(msg, parse_mode='Markdown', reply_markup=get_main_menu(lang))
-    # try:
-    #     await q.message.delete() # Optional: delete the message with the lang buttons
-    # except Exception as e:
-    #     logger.warning(f"Could not delete language selection message: {e}")
-
 
 async def language_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
@@ -135,76 +247,12 @@ async def language_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    lang = user_languages.get(uid, 'en')
+    lang = user_languages.get(update.effective_user.id, 'en')
     menu = get_main_menu(lang)
-    if lang=='en':
-        text = '1️⃣ Send YouTube link (standard or googleusercontent.com/youtube.com/NUMERIC_ID format)\n2️⃣ Receive bullet points + narrative summary\n3️⃣ /language to change language'
-    else:
-        text = '1️⃣ Отправьте ссылку YouTube (стандартного формата или googleusercontent.com/youtube.com/ЧИСЛОВОЙ_ID)\n2️⃣ Получите пункты + пересказ\n3️⃣ /language для смены языка'
-    await update.message.reply_text(text, parse_mode='Markdown', reply_markup=menu)
+    text_en = '1️⃣ Send YouTube link (standard or googleusercontent.com/youtube.com/NUMERIC_ID format)\n2️⃣ Receive bullet points + narrative summary\n3️⃣ /language to change language'
+    text_ru = '1️⃣ Отправьте ссылку YouTube (стандартного формата или googleusercontent.com/youtube.com/ЧИСЛОВОЙ_ID)\n2️⃣ Получите пункты + пересказ\n3️⃣ /language для смены языка'
+    await update.message.reply_text(text_en if lang == 'en' else text_ru, parse_mode='Markdown', reply_markup=menu)
 
-
-def fetch_transcript(video_id: str): # Expects 11-character video_id
-    logger.info(f"Fetching transcript for 11-char video_id: {video_id}")
-    logger.info("Reminder: Ensure 'youtube-transcript-api' and 'pytube' are up-to-date ('pip install --upgrade youtube-transcript-api pytube')")
-    try:
-        transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
-        transcript = None
-        for lang_code in ['ru', 'en']:
-            try:
-                transcript = transcript_list.find_manually_created_transcript([lang_code])
-                logger.info(f"Found manual '{lang_code}' transcript for {video_id} via youtube_transcript_api.")
-                break
-            except: continue
-        if not transcript:
-            for lang_code in ['ru', 'en']:
-                try:
-                    transcript = transcript_list.find_generated_transcript([lang_code])
-                    logger.info(f"Found generated '{lang_code}' transcript for {video_id} via youtube_transcript_api.")
-                    break
-                except: continue
-        if transcript:
-            return transcript.fetch()
-        else:
-             logger.warning(f"No ru/en transcript found by youtube_transcript_api for {video_id}. Attempting pytube fallback.")
-    except Exception as e:
-        logger.warning(f'youtube_transcript_api error for video_id {video_id}: {e}')
-
-    try:
-        logger.info(f"Attempting pytube fallback for video_id: {video_id}")
-        standard_url = f'https://www.youtube.com/watch?v={video_id}'
-        yt = YouTube(standard_url)
-        cap = None
-        lang_prefs = ['ru', 'en', 'a.ru', 'a.en']
-        pytube_captions = yt.captions
-        for lang_code in lang_prefs:
-            if lang_code in pytube_captions:
-                cap = pytube_captions[lang_code]
-                logger.info(f"Pytube found caption: {cap.code} for video {video_id}")
-                break
-        if not cap and len(pytube_captions) > 0:
-            cap = pytube_captions[0]
-            logger.info(f"Pytube: No preferred (ru/en) caption. Using first available: {cap.code} for video {video_id}")
-        if not cap:
-            logger.warning(f'Pytube: No captions found for video {video_id} using URL {standard_url}')
-            return None
-        srt = cap.generate_srt_captions()
-        entries = []
-        pattern = re.compile(r"\d+\n(\d{2}):(\d{2}):(\d{2}),\d{3} --> \d{2}:\d{2}:\d{2},\d{3}\n(.*?)(?:\n\n|\Z)", re.S)
-        for match in pattern.finditer(srt):
-            h, mn, s = int(match.group(1)), int(match.group(2)), int(match.group(3))
-            start_time = h * 3600 + mn * 60 + s
-            text_content = match.group(4).replace('\n', ' ').strip()
-            entries.append({'start': start_time, 'text': text_content})
-        if not entries:
-            logger.warning(f"Pytube: SRT parsing yielded no entries for {video_id}")
-            return None
-        logger.info(f"Pytube successfully processed captions for {video_id}")
-        return entries
-    except Exception as e:
-        logger.error(f'Pytube fallback error for video_id {video_id}: {e}') # This was the "HTTP Error 400"
-        return None
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -227,63 +275,45 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await help_cmd(update, context)
         return
 
-    video_id_11_char = None
-    status_message_resolve = None # To keep track of the "resolving" message
+    video_url_or_id_for_yt_dlp = None # Это будет либо URL, либо 11-значный ID
+    status_message_resolve = None 
 
     std_match = YOUTUBE_STD_REGEX.search(text_input)
     if std_match:
-        video_id_11_char = std_match.group(1)
-        logger.info(f"Extracted standard 11-char video ID: {video_id_11_char}")
+        video_url_or_id_for_yt_dlp = std_match.group(1) # Используем 11-значный ID
+        logger.info(f"Extracted standard 11-char video ID: {video_url_or_id_for_yt_dlp}")
     else:
         guc_match = YOUTUBE_GOOGLEUSERCONTENT_NUMERIC_REGEX.search(text_input)
         if guc_match:
             numeric_url = guc_match.group(1)
-            numeric_id_part = guc_match.group(2)
-            logger.info(f"Detected googleusercontent numeric URL: {numeric_url} (ID part: {numeric_id_part})")
-            resolve_msg_text = 'Resolving special link format...' if lang == 'en' else 'Обработка специального формата ссылки...'
-            status_message_resolve = await update.message.reply_text(resolve_msg_text, reply_markup=menu)
-            try:
-                yt_obj = YouTube(numeric_url)
-                video_id_11_char = yt_obj.video_id
-                if not (video_id_11_char and re.fullmatch(r'[A-Za-z0-9_-]{11}', video_id_11_char)):
-                    logger.warning(f"Pytube resolved {numeric_url} to '{video_id_11_char}', not a valid 11-char ID.")
-                    video_id_11_char = None
-                else:
-                    logger.info(f"Pytube resolved {numeric_url} to 11-char video ID: {video_id_11_char}")
-                    if status_message_resolve: # Delete "resolving" message on success
-                        try: await status_message_resolve.delete()
-                        except Exception: pass # Ignore if already deleted or other issue
-                        status_message_resolve = None # Clear it
-            except Exception as e:
-                logger.error(f"Failed to resolve numeric URL {numeric_url} with pytube: {e}")
-                error_msg_resolve = 'Could not resolve this video link format. Pytube error.' if lang == 'en' else 'Не удалось обработать этот формат ссылки. Ошибка Pytube.'
-                status_message_resolve = await robust_edit_text(status_message_resolve, error_msg_resolve, context, update, menu)
-                return # Stop processing if resolution failed
+            logger.info(f"Detected googleusercontent numeric URL: {numeric_url}")
+            # yt-dlp может сам обработать этот URL, так что передаем его напрямую
+            video_url_or_id_for_yt_dlp = numeric_url
+            # Можно опционально попытаться извлечь 11-значный ID через pytube, если yt-dlp вдруг не справится
+            # Но сейчас мы полагаемся на yt-dlp для обработки всех URL.
+            # Сообщение "Resolving" теперь менее актуально, так как yt-dlp делает это внутренне.
         else:
-            msg = 'Invalid YouTube URL. Please send a valid link.' if lang == 'en' else 'Недействительная ссылка YouTube. Пожалуйста, отправьте действительную ссылку.'
+            msg = 'Invalid YouTube URL.' if lang == 'en' else 'Недействительная ссылка YouTube.'
             await update.message.reply_text(msg, reply_markup=menu)
             return
 
-    if not video_id_11_char:
-        # If status_message_resolve still exists here, it means resolution failed and message was already updated by robust_edit_text.
-        # If it's None, and no video_id, means it wasn't a numeric URL either.
-        if not status_message_resolve : # Only send if no previous error message was shown
-            msg = 'Could not extract a valid video ID from the link provided.' if lang == 'en' else 'Не удалось извлечь действительный ID видео из предоставленной ссылки.'
-            await update.message.reply_text(msg, reply_markup=menu)
+    if not video_url_or_id_for_yt_dlp:
+        msg = 'Could not extract a valid video ID/URL.' if lang == 'en' else 'Не удалось извлечь валидный ID/URL видео.'
+        await update.message.reply_text(msg, reply_markup=menu)
         return
     
-    vid = video_id_11_char
     processing_msg_text = 'Processing the video... this might take a moment.' if lang == 'en' else 'Обрабатываю видео... это может занять некоторое время.'
     status_message = await update.message.reply_text(processing_msg_text, reply_markup=menu)
     
-    trans = fetch_transcript(vid)
+    # Вызываем новую функцию с yt-dlp. Передаем logger.
+    trans = await fetch_transcript_with_yt_dlp(video_url_or_id_for_yt_dlp, logger_obj=logger)
     
     if not trans:
-        no_trans_msg = ('Sorry, I could not retrieve subtitles for this video. They might be unavailable or disabled.'
+        no_trans_msg = ('Sorry, I could not retrieve subtitles for this video with yt-dlp. They might be unavailable or disabled.'
                         if lang == 'en' else
-                        'К сожалению, не удалось получить субтитры для этого видео. Возможно, они недоступны или отключены.')
+                        'К сожалению, не удалось получить субтитры для этого видео с помощью yt-dlp. Возможно, они недоступны или отключены.')
         status_message = await robust_edit_text(status_message, no_trans_msg, context, update, menu)
-        return # Important to return here
+        return
 
     parts = []
     for entry in trans:
@@ -296,17 +326,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     max_chars_for_transcript = 10000
     if len(full_transcript_text) > max_chars_for_transcript:
-        full_transcript_text = full_transcript_text[:max_chars_for_transcript] + "\n[Transcript truncated due to length]"
-        logger.info(f"Transcript for {vid} was truncated.")
+        full_transcript_text = full_transcript_text[:max_chars_for_transcript] + "\n[Transcript truncated...]"
+        logger.info(f"Transcript for {video_url_or_id_for_yt_dlp} was truncated.")
 
-    instr_en = ('You are a helpful assistant. Based on the following video transcript with timestamps, provide:'
-                '\n1. A list of key bullet points (3-7 points) with their corresponding timestamps.'
-                '\n2. A concise narrative summary of the video content in 2-3 paragraphs, starting each paragraph with a relevant timestamp or time range if applicable.'
-                '\n\nTranscript:\n')
-    instr_ru = ('Ты полезный ассистент. На основе следующей расшифровки видео с таймкодами, предоставь:'
-                '\n1. Список ключевых моментов (3-7 пунктов) с соответствующими таймкодами.'
-                '\n2. Краткий последовательный пересказ содержания видео в 2-3 абзацах, начиная каждый абзац с соответствующего таймкода или временного диапазона, если применимо.'
-                '\n\nРасшифровка:\n')
+    instr_en = ('List key bullet points (3-7) with timestamps, then a concise 2-3 paragraph summary starting each with timestamp.\n\nTranscript:\n')
+    instr_ru = ('Сначала пункты (3-7) с таймкодами, затем 2-3 абзаца пересказа с таймкодами в начале каждого.\n\nРасшифровка:\n')
     prompt = (instr_en if lang == 'en' else instr_ru) + full_transcript_text
 
     gen_summary_msg = 'Generating summary...' if lang == 'en' else 'Генерация аннотации...'
@@ -325,27 +349,26 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         status_message = await robust_edit_text(status_message, summary_text, context, update, menu, parse_mode='Markdown')
     except openai.error.OpenAIError as e:
         logger.error(f"OpenAI API error: {e}")
-        openai_err_msg = (f"Sorry, I encountered an error while generating the summary: {e}"
-                          if lang == 'en' else
-                          f"Извините, произошла ошибка при генерации аннотации: {e}")
+        openai_err_msg = (f"OpenAI error: {e}" if lang == 'en' else f"Ошибка OpenAI: {e}")
         status_message = await robust_edit_text(status_message, openai_err_msg, context, update, menu)
     except Exception as e:
-        logger.error(f"An unexpected error occurred in handle_message: {e}")
-        unexpected_err_msg = "An unexpected error occurred." if lang == 'en' else "Произошла непредвиденная ошибка."
+        logger.error(f"Unexpected error in handle_message (OpenAI part): {e}")
+        unexpected_err_msg = "Unexpected error with OpenAI." if lang == 'en' else "Непредвиденная ошибка с OpenAI."
         status_message = await robust_edit_text(status_message, unexpected_err_msg, context, update, menu)
 
-# Webhook entry
+# Webhook entry (как и раньше)
 if __name__=='__main__':
     application = Application.builder().token(BOT_TOKEN).build()
     application.add_handler(CommandHandler('start', start))
+    # ... (остальные обработчики как в предыдущей версии) ...
     application.add_handler(CommandHandler('language', language_cmd))
     application.add_handler(CommandHandler('help', help_cmd))
     application.add_handler(CallbackQueryHandler(language_button, pattern='^lang_'))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     
-    webhook_path = f"/{BOT_TOKEN.split(':')[-1]}" # Or a fixed path like "/webhook"
+    webhook_path = f"/{BOT_TOKEN.split(':')[-1]}" 
     webhook_url = APP_URL.rstrip('/') + webhook_path
-    logger.info(f"Attempting to start webhook at {webhook_url} on port {PORT} with path {webhook_path}")
+    logger.info(f"Starting webhook: {webhook_url} on port {PORT}, path {webhook_path}")
     application.run_webhook(
         listen='0.0.0.0', port=PORT, url_path=webhook_path,
         webhook_url=webhook_url, drop_pending_updates=True
