@@ -18,7 +18,7 @@ from youtube_transcript_api import YouTubeTranscriptApi
 BOT_TOKEN = os.getenv('BOT_TOKEN')
 OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
 APP_URL = os.getenv('APP_URL')      # e.g. https://your-app.onrender.com
-PORT = int(os.getenv('PORT', 10000))
+PORT = int(os.getenv('PORT', 443))
 
 if not BOT_TOKEN or not OPENAI_API_KEY or not APP_URL:
     raise RuntimeError('BOT_TOKEN, OPENAI_API_KEY, and APP_URL must be set')
@@ -146,18 +146,23 @@ def main():
     app.add_handler(CallbackQueryHandler(language_button, pattern='^lang_'))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    # Webhook setup
-    # Ensure PORT is provided by environment
-    port = int(os.environ.get('PORT'))
+        # Webhook setup
+    port = int(os.getenv('PORT'))
     webhook_path = f"/bot{BOT_TOKEN}"
     webhook_url = f"{APP_URL}{webhook_path}"
 
-    # Set webhook explicitly
-    logger.info(f"Setting webhook to {webhook_url}")
-    app.bot.delete_webhook(drop_pending_updates=True)
-    app.bot.set_webhook(webhook_url)
+    # Start webhook listener with built-in webhook registration
+    logger.info(f"Starting webhook listener on port {port}, path {webhook_path}, URL {webhook_url}")
+    app.run_webhook(
+        listen='0.0.0.0',
+        port=port,
+        url_path=webhook_path,
+        webhook_url=webhook_url,
+        drop_pending_updates=True,
+    )
 
-    # Start webhook listener
+if __name__=='__main__':
+    main()
     logger.info(f"Starting webhook listener on port {port}, path {webhook_path}")
     app.run_webhook(
         listen='0.0.0.0',
