@@ -140,14 +140,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.info("Transcript unavailable, notifying user")
         return await update.message.reply_text(msg2, reply_markup=menu)
 
-    # Build transcript text
+        # Build transcript text
     segs = []
     for e in trans:
         s = int(e['start']); t = e['text']
         mns, secs = divmod(s, 60)
         segs.append(f"[{mns:02d}:{secs:02d}] {t}")
-    full = "
-".join(segs)
+    full = "\n".join(segs)
     logger.info(f"Built full transcript text, length {len(full)}")
 
     # AI prompt
@@ -157,9 +156,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         instr = ('Сначала пункты с таймкодами. '
                  'Затем 2-3 абзаца пересказа с таймкодами.')
-    prompt = instr + "
-
-" + full
+    prompt = instr + "\n\n" + full
     logger.info(f"Constructed AI prompt, length {len(prompt)}")
 
     try:
@@ -175,35 +172,25 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(out, parse_mode='Markdown', reply_markup=menu)
     logger.info("Sent final summary to user")
-    segs = []
-    for e in trans:
-        s = int(e['start']); t = e['text']
-        mns, secs = divmod(s, 60)
-        segs.append(f"[{mns:02d}:{secs:02d}] {t}")
-    full = "\n".join(segs)
-
-    # AI prompt
-    if lang=='en':
-        instr = ('List key bullet points with timestamps. ' 
-                 'Then 2-3 paragraph summary starting each with timestamp.')
-    else:
-        instr = ('Сначала пункты с таймкодами. ' 
-                 'Затем 2-3 абзаца пересказа с таймкодами.')
-    prompt = instr + "\n\n" + full
-
-    try:
-        res = openai.ChatCompletion.create(
-            model='gpt-3.5-turbo',
-            messages=[{'role':'user','content':prompt}], max_tokens=600
-        )
-        out = res.choices[0].message.content
-    except Exception as e:
-        logger.error(f'AI error: {e}')
-        return await update.message.reply_text('Error.', reply_markup=menu)
-
-    await update.message.reply_text(out, parse_mode='Markdown', reply_markup=menu)
 
 # Keep-alive ping
+def ping():
+    while True:
+        if APP_URL:
+            try: httpx.get(APP_URL)
+            except: pass
+        time.sleep(30)
+
+# Run bot
+if __name__=='__main__':
+    threading.Thread(target=ping, daemon=True).start()
+    app = Application.builder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler('start', start))
+    app.add_handler(CommandHandler('language', language_cmd))
+    app.add_handler(CommandHandler('help', help_cmd))
+    app.add_handler(CallbackQueryHandler(language_button, pattern='^lang_'))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.run_polling()
 def ping():
     while True:
         if APP_URL:
