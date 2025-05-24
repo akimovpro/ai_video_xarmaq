@@ -145,11 +145,11 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     # Start webhook
+        # Start webhook listener on path 'bot<token>'
+    webhook_path = f"/bot{BOT_TOKEN}"
     app.run_webhook(
         listen='0.0.0.0',
         port=PORT,
-        webhook_url=f"{APP_URL}/bot{BOT_TOKEN}"
+        url_path=webhook_path,
+        webhook_url=f"{APP_URL}{webhook_path}"
     )
-
-if __name__=='__main__':
-    main()
